@@ -25,10 +25,11 @@ just add one and keep in store which address we're at: no deletion implemented y
 type address = int
 
 type register = (string * value ref)
-type registers = reigister list
+and registers = register list
 
-type bytecode =
+and bytecode =
 |GEN (*Generate value*)
+|LOD (*Load value*)
 |LFE (*Load from environment*)
 |MTE (*Move to environment*)
 |PVR (*Place value in register*)
@@ -43,11 +44,10 @@ type bytecode =
 |SEV (*Set environment size*)
 |LUA (*Look up address*)
 |BEZ (*Branch if equal to zero*)
-|JMP (*Jump*)
 |Label of int (*Label for branching*)
 |END (*Terminate program*)
 
-type ins = 
+and ins = 
 |Value of bytecode * value (*GEN*)
 |Arith of bytecode * register * int (*PVR, AVR, MVR*)
 |Mov of bytecode * register * register (*MOV*)
@@ -55,13 +55,14 @@ type ins =
 |Mem of bytecode * register * register (*LAR, SAR*)
 |Unary of bytecode * register (*CNA, IUE, SEV*)
 |Branch of bytecode * register * int
+|LabelBC of bytecode
 |Jump of bytecode
 |Pseudo of bytecode * register * var (*LUA*)
 |Halt of bytecode
 
-type program = ins list
+and program = ins list
 
-type value = 
+and value = 
 | CloLam of env * var * term
 | CloSig of env * var * term
 | ByteCloLam of env * var * program
@@ -122,7 +123,7 @@ let index (t : bool) (n : int) =
     let a = !counter in
     incr counter;
     a
-  in let set_index = fun () -> counter := n in
+  in let set_index = fun () -> counter := n + 1; n in
   if t then fresh_index () else set_index ()
 
 let fresh_label =
@@ -313,10 +314,6 @@ let rec evalCPS (st : store) (r : env) (t : term) (k : value -> store -> 'gamma)
 )
 
 
-
-
-
-
 (*-------------------------------------------------VERSION 3-----------------------------------------------------*)
 
 
@@ -342,33 +339,30 @@ type cont =
 
 (*Program start*)
 
-(*let funs : (var * program ref) list ref = ref [];
-let (vals, final_vals) : (value list * value list ref) = ([], ref []);*)
-
-let get_fun : unit =
+let get_fun funs vals final_vals : unit =
   match !funs with
   | (x, l) :: ls ->
     funs := ls;
     (*Once a term is done being evaluated, deposite the code that represents it in the list*)
-    let v = List.assoc x vals in 
+    let v = List.assoc x !vals in 
     (match v with
-      | ByteCloLam(r, x, _) -> final_vals := !final_funs @ [ByteCloLam(r, x, !l)]
-      | ByteCloSig(r, x, _) -> final_vals := !final_funs @ [ByteCloSig(r, x, !l)]
+      | ByteCloLam(r, x, _) -> final_vals := !final_vals @ [ByteCloLam(r, x, !l)]
+      | ByteCloSig(r, x, _) -> final_vals := !final_vals @ [ByteCloSig(r, x, !l)]
       | _ -> failwith "Not a function!");
-  | [] -> ();
+  | [] -> ()
 
-let add_fun (x : var) (v : value) : unit =
+and add_fun (x : var) (v : value) funs vals : unit =
    funs := (x, ref []) :: !funs;
-   vals = v :: vals;
+   vals := (x, v) :: !vals
 
-let build_funs (p : program) : unit = 
-  funs := List.map(fun (_, l) -> l := p @ !l ) !funs;
+and build_funs (p : program) funs : unit = 
+  funs := List.map(fun (x, l) -> (x, ref (p @ !l)) ) !funs
 
-let emit (p : program ref) (l : program) : unit =
-  build_funs l; p := !p @ l;
+let emit (p : program ref) funs (l : program) : unit =
+  build_funs l funs; p := !p @ l
 
 let get_reg (rs : registers) (reg : string) : register =
-    List.find (fun (name, _) -> reg = name) regs
+    List.find (fun (name, _) -> reg = name) rs
 
 let get_regs (regs: registers) (names : string list) : registers =
 let rec get (regs: registers) (names : string list) (rs : registers) : registers =
@@ -377,83 +371,97 @@ let rec get (regs: registers) (names : string list) (rs : registers) : registers
     |n::ns -> get regs ns ((get_reg regs n)::rs)
 in get regs names []
 
-let fun_rec_list : (var * int) list ref = ref [] in
-let fix_bindings : value list ref = ref [] in
-
-let free_space (h : store) (p : env) (p' : env) : store * address =
+(*let free_space (h : store) (p : env) (p' : env) : store * address =
     let (i, j) = (List.length p, List.length p') in
     set_top i;
     (TermMap.mapi (fun k v -> 
       if (k >= i && j > k) then 
-        None else v) h, i)
+        None else v) h, i)*)
+
+let get_values = 
+  let fun_rec_list : (var * int) list ref = ref [] in
+  let funs : (var * program ref) list ref = ref [] in
+  let (vals, final_vals) : ((var * value) list ref * value list ref) = (ref [], ref []) in
+  fun () -> (funs, vals, final_vals, fun_rec_list)
 
 let code_gen (st : store) (r : env) (value : value) (k : cont) (rs : registers) (prog : program ref) : unit =
-  let emit' = emit prog in 
+  let (funs, vals, final_vals, fun_rec_list) = get_values () in
+  let fix_bindings : value list ref = ref [] in
+  let emit' = emit prog funs in 
+  let get_regs' = get_regs rs in
   
   match k with
-   | Halt -> emit' [Terminate(END)]
+   | Halt -> emit' [Halt(END)]
 
-   | Ar(r, t2, k) | AddAr(r, t2, k) | MultAr(r, t2, k) | IfAr(r, t1, t2, k) ->
-    let [fp;sp;r1;;v] = get_regs ["fp";"sp";"r1";"v"] in
-    let l = [Unary(SEV, sp), Mov(MOV, sp, fp)] in emit l 
+   | Ar(r, t2, k) | AddAr(r, t2, k) | MultAr(r, t2, k) | IfAr(r, _, t2, k) ->
+    let [fp;sp;r1;v] = get_regs' ["fp";"sp";"r1";"v"] in
+    get_fun funs vals final_vals;
+    let l = [Unary(SEV, sp); Mov(MOV, sp, fp)] in emit' l 
 
    | Ap (CloLam(r, x, t), k) -> 
-    let [sp;r1;v] = get_regs ["sp";"r1";"v"] in
+    let [fp;sp;r1;v] = get_regs' ["fp";"sp";"r1";"v"] in
     let vv = ByteCloLam(r, x, []) in
-    add_fun(x, vv);
-    let l = [Value(GEN, vv); Unary(CNI, fp); Env(MTE, v, r1)] in emit l 
+    add_fun x vv funs vals;
+    let l = [Value(GEN, vv); Unary(CNI, fp); Mov(MOV, fp, sp); Env(MTE, v, r1)] in emit' l 
 
    | Ap (CloSig(r, x, t), k) -> 
-    let [fp;r1;v] = get_regs ["fp";"sp";"r1";"v"] in
+    let [fp;sp;r1;v] = get_regs' ["fp";"sp";"r1";"v"] in
     let vv = ByteCloSig(r, x, []) in
-    add_fun(x, vv);
+    add_fun x vv funs vals;
     let l = [Value(GEN, vv); Unary(CNI, fp); Unary(CNA, r1);
-            Mov(MOV, fp, sp); Env(MTE, r1, fp); Mem(SAR, v, r1)] in emit l 
+            Mov(MOV, fp, sp); Env(MTE, r1, fp); Mem(SAR, v, r1)] in emit' l 
 
    | AddAp(IntVal int1, k) -> 
-    let [v] = get_regs ["v"] in
-    let l = [Arith(AVR, v, int1)] in emit l 
+    let [v] = get_regs' ["v"] in
+    let l = [Arith(AVR, v, int1)] in emit' l 
 
    | MultAp(IntVal int1, k) -> 
-    let [v] = get_regs ["v"] in
-    let l = [Arith(MVR, v, int1)] in emit l 
+    let [v] = get_regs' ["v"] in
+    let l = [Arith(MVR, v, int1)] in emit' l 
    
    | FixAr k2 ->
      (* v must be a function closure *)
-    let [r1;fp;(_, v') as v] = get_regs ["r1";"fp";"v"] in
-    match v' with
+    let [r1;fp;(_, v') as v] = get_regs' ["r1";"fp";"v"] in
+    (match !v' with
     | ByteCloLam(_, x, _) ->
-      let f = List.assoc_opt x fun_rec_list in
+      let f = List.assoc_opt x !fun_rec_list in
       (match f with
       |Some a -> 
         let l = [Unary(CNI, fp); Unary(CNA, r1); Env(MTE, r1, fp); 
-                Mem(SAR, v, r1); Jump(Label a)] in emit l;
+                Mem(SAR, v, r1); LabelBC(Label a)] in emit' l;
                 let (_, r1') = r1 in
-                fix_bindings := !r1' :: !fix_bindings)
-    |None -> failwith "Recursive call not defined!" 
+                fix_bindings := !r1' :: !fix_bindings
+      |None -> failwith "Recursive call not defined!" )
+    | _ -> failwith "Needs to be a function!")
  
    | FixDone (a, k2) ->
     (* Store the result into the reserved address, then continue *)
-    let [sp;r1;v] = get_regs ["r1";"v"] in
+    let [sp;r1;v] = get_regs' ["r1";"v"] in
     (match !fix_bindings with
     | b :: bs -> 
       fix_bindings := bs;
-      let l = [Value(GEN, r1, b); Env(MTE, v, r1)] in emit l 
+      let l = [Value(LOD, b); Env(MTE, v, r1)] in emit' l 
     | _ -> failwith "Not in a recursive call")
   | _ -> failwith "Invalid argument types"
 
 (*Back to part 4, with some additions for bytecode stuff*)
 
-let rec eval (st : store) (r : env) (k : cont) (rs : registers) (prog : program ref) : (value * store) =
+let rec eval (st : store) (r : env) (t : term) (k : cont) (rs : registers) (prog : program ref) : (value * store) =
   
+  let eval' (st : store) (r : env) (t : term) (k : cont) : (value * store) = 
+    eval st r t k rs prog in
+  let (funs, vals, final_vals, fun_rec_list) = get_values () in
+  let emit' = emit prog funs in 
+  let get_regs' = get_regs rs in
+
   let apply' (st : store) (v : value) (k : cont) : (value * store) =
    apply st v k rs prog
   in 
 
   match t with
   | Var x ->
-      let [v] = get_regs ["v"] in
-      let l = [Pseudo(LUA, v, x)] in emit l;
+      let [v] = get_regs' ["v"] in
+      let l = [Pseudo(LUA, v, x)] in emit' l;
       apply' st (lookup_env r x st) k
   | Lam(x, t') ->
       apply' st (CloLam(r, x, t')) k
@@ -461,32 +469,38 @@ let rec eval (st : store) (r : env) (k : cont) (rs : registers) (prog : program 
     apply' st (CloSig(r, x, t')) k
   | App(t1, t2) ->
       (* Evaluate t1 first and notify through Ar that t2 needs to be evaluated next*)
-      eval st r t1 (Ar(r, t2, k))
+      eval' st r t1 (Ar(r, t2, k))
   | Int n ->  
-      let [v] = get_regs ["v"] in
-      let l = [Arith(PVR, v, n)] in emit l;
+      let [v] = get_regs' ["v"] in
+      let l = [Arith(PVR, v, n)] in emit' l;
       apply' st (IntVal n) k
   | Add(t1,t2) ->
-      eval st r t1 (AddAr(r, t2, k))
+      eval' st r t1 (AddAr(r, t2, k))
   | Mult(t1,t2) ->
-    eval st r t1 (MultAr(r, t2, k))
+    eval' st r t1 (MultAr(r, t2, k))
   | IfZero(t, t1, t2) ->
-    eval st r t (IfAr(r, t1, t2, k))
+    eval' st r t (IfAr(r, t1, t2, k))
   | Fix t -> 
     (* Generate a label to jump back to, and store which function this is in memory *)
     (match t with 
     | Lam(x, t') | Sig (x, t') ->
         let a = fresh_label () in
         fun_rec_list := (x, a) :: !fun_rec_list;
-        eval st r t (FixAr k)
+        eval' st r t (FixAr k)
     | _ -> failwith "Must fix an abstraction!")
 and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program ref) : (value * store) =
   
-  let emit' = emit prog in 
+  let (funs, vals, final_vals, _) = get_values () in
+  let emit' = emit prog funs in 
+  let get_regs' = get_regs rs in
   let eval' (st : store) (r : env) (t : term) (k : cont) : (value * store) = 
     code_gen st r v k rs prog;
     eval st r t k rs prog
   in
+
+  let apply' (st : store) (v : value) (k : cont) : (value * store) =
+    apply st v k rs prog
+   in 
 
   match k with
   | Halt -> (v,st) (*this is the final state mentioned in class --> from theorem will always be reached!*)
@@ -498,21 +512,21 @@ and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program r
     eval' st' r' t k
   | AddAr(r, t2, k) -> eval' st r t2 (AddAp(v, k))
   | AddAp(IntVal int1, k) -> (match v with
-    | IntVal int2 -> apply st (IntVal(int1 + int2)) k
+    | IntVal int2 -> apply' st (IntVal(int1 + int2)) k
     | _ -> failwith "both arguments of Add need to evaluate to integers!")
-  | MultAr(r, t2, k) -> eval st r t2 (MultAp(v, k))
+  | MultAr(r, t2, k) -> eval' st r t2 (MultAp(v, k))
   | MultAp(IntVal int1, k) -> (match v with
-    | IntVal int2 -> apply st (IntVal(int1 * int2)) k
+    | IntVal int2 -> apply' st (IntVal(int1 * int2)) k
     | _ -> failwith "both arguments of Mult need to evaluate to integers!")
   | IfAr(r, t1, t2, k) -> 
     (*We need to do some bytecode splicing here*)
     let a = fresh_label () in
-    let [v] = get_regs  ["v"] in
-    emit [Branch(BEZ, v, a)];
+    let [vv] = get_regs'  ["v"] in
+    emit' [Branch(BEZ, vv, a)];
     (match v with
     | IntVal 0 -> eval' st r t1 k
     | IntVal _ -> 
-      emit [LabelBC(Label a)];
+      emit' [LabelBC(Label a)];
       eval' st r t2 k
     | _ -> failwith "The condition of the if statement needs to evaluate to an integer!")
   
@@ -531,7 +545,7 @@ and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program r
   | FixDone (a, k2) ->
       (* Store the result into the reserved address, then continue *)
       let st' = addOrUpdate_store st a v in
-      apply st' v k2
+      apply' st' v k2
 
   | _ -> failwith "Invalid argument types"
 
@@ -539,7 +553,7 @@ and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program r
 (*example given in class to run this version of eval*)
 (*in class: eval' e = eval [] e (fun x -> x) but we defunctionalised it*)
 let eval' (t:term) : value  =
-  fst (eval TermMap.empty [] t (Halt)) (*both store and env start up as empty*)
+  fst (eval TermMap.empty [] t (Halt) [] (ref [])) (*both store and env start up as empty*)
 
 (*Creating these same helpers for the versions 1 and 2 of eval*)
 let evalCPS' (t:term) : value =
@@ -616,9 +630,10 @@ let init (size : int) : env * store =
   |n -> TermMap.add n None (store_init (n - 1))
 in ([], heap)
 
-let compile (t : term) (size : int) : (value * program) =
+let compile (t : term) (size : int) : (value * program * value list) =
   let (env, store) = init size in
   let p : program ref = ref [] in
-  let regs = [("fp", ref EnvAddr 0);("sp", ref EnvAddr 0); ("r1", ref EnvAddr 0); ("v", ref EnvAddr 0)];
+  let regs = [("fp", ref EnvAddr 0);("sp", ref EnvAddr 0); ("r1", ref EnvAddr 0); ("v", ref EnvAddr 0)] in
   let (v, _) = eval store [] t (Halt) regs p in
-  (v, !p);
+  let (_, _, l, _) = get_values in
+  (v, !p, !l)
