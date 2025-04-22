@@ -136,15 +136,19 @@ let fresh_label =
   
 (*THIS HANDLES ALL THE CASES *)
 (*1. a new immutable variable --> only update the environment*)
-let add_immutable_env (r : env) (x : var) (v : value) : env =
+let add_immutable_val (r : env) (x : var) (v : value) : env =
   (x, EnvVal v) :: r
+
+(*for recursion: a new address --> but no need to update the store just yet*)
+let add_immutable_addr (r : env) (x : var) (a : address) : env =
+  (x, EnvAddr a) :: r
 
 
 
 (*2. a new mutable variable --> update both with the new address
 3. an existing mutable variable --> only update te store *)
 (*I combine both 2 and 3 in one so that when using a sigma abstraction if x already exists there wont be a new binding that will be added by default: the store will simply be updated --> this is what I call mutability*)
-(*In all honnesty, was struggling so much with doing these 2 simultaneously that I ended up getting it from Chat GPT*)
+(*was struggling so much with doing these 2 simultaneously that I ended up getting it with Chat GPT's help*)
 let addOrUpdate_mutable (r : env) (x : var) (v : value) (st : store) : env * store =
   try
     match List.assoc x r with
@@ -180,7 +184,7 @@ let rec eval_direct (st : store) (r : env) (t : term) : (value * store) =
       (*like in class evaluate t2*)
       let (v, st2) = eval_direct st1 r t2 in
       (*& extend the store accordingly*)
-      eval_direct st2 (add_immutable_env (r') (x) (v)) t
+      eval_direct st2 (add_immutable_val (r') (x) (v)) t
 
       | (CloSig(r', x, t), st1) ->
         (*like in class evaluate t2*)
@@ -192,53 +196,42 @@ let rec eval_direct (st : store) (r : env) (t : term) : (value * store) =
       | _ -> failwith "t1 needs to evaluate to a closure in applications!"
     )
 
-    | Int n  ->(IntVal n, st)
+  | Int n  ->(IntVal n, st)
 
-    | Add(t1,t2) ->
-      let (v1, st1) = eval_direct st r t1 in
-      let (v2, st2) = eval_direct st1 r t2 in (*use the store we got AFTER evaling t1*)
-      (match (v1, v2) with
-        | (IntVal int1, IntVal int2) -> (IntVal(int1+int2), st2) 
-        | _ -> failwith "both arguments of Add need to evaluate to integers!")
-    | Mult(t1,t2) -> (*just like add*)
-      let (v1, st1) = eval_direct st r t1 in
-      let (v2, st2) = eval_direct st1 r t2 in 
-      (match (v1, v2) with
-        | (IntVal int1, IntVal int2) -> (IntVal(int1*int2), st2) 
-        | _ -> failwith "both arguments of Mult need to evaluate to integers!")
+  | Add(t1,t2) ->
+    (match eval_direct st r t1 with
+      | (IntVal(v1), st1) ->
+        (match eval_direct st1 r t2 with
+          | (IntVal(v2), st2) -> (IntVal(v1+v2), st2) 
+          | _ -> failwith "second arguments of Add need to evaluate to an integer!")
+      | _ -> failwith "first arguments of Add need to evaluate to an integer!")
+  | Mult(t1,t2) -> (*just like add*)
+    (match eval_direct st r t1 with
+      | (IntVal(v1), st1) ->
+        (match eval_direct st1 r t2 with
+          | (IntVal(v2), st2) -> (IntVal(v1*v2), st2) 
+          | _ -> failwith "second arguments of Add need to evaluate to an integer!")
+      | _ -> failwith "first arguments of Add need to evaluate to an integer!")
+  
+  | IfZero(t, t1, t2) ->
+    (match  eval_direct st r t with
+      | (IntVal 0, st1) -> eval_direct st1 r t1
+      | (IntVal _, st1) -> eval_direct st1 r t2
+      | _ -> failwith "The condition of the if statement needs to evaluate to an integer!")
+      
+  
+  | Fix t ->
+    match eval_direct st r t with
+    | (CloLam (r', f, t'), st1) ->
+        let a  = fresh_address () in
+        (*f is added to the env now, even though a is still empty: so that the recursive calls to f are not unbound*)
+        let (v', st2) = eval_direct st1 (add_immutable_addr r' f a) t' in
+        (*eval will return what the body of f evaluates to and we we store at a aka the address of f in the store*)
+        let st3 = addOrUpdate_store st2 a v' in 
+        (v', st3) (*so when well apply Fix to something it will recurse*)
+    | _ -> failwith "Fix can only take in as input a lamda function"
     
-    | IfZero(t, t1, t2) ->
-        let (v, st1) = eval_direct st r t in
-        (match v with
-         | IntVal 0 -> eval_direct st1 r t1
-         | IntVal _ -> eval_direct st1 r t2
-         | _ -> failwith "The condition of the if statement needs to evaluate to an integer!"
-        )
-    
-    | Fix t ->
-    (* 1) Evaluate the function term to a closure *)
-    let (vf, st1) = eval_direct st r t in
-
-    (match vf with
-      | CloLam (r_clo, x, body) ->
-          (* 2) Allocate exactly one address for “f” *)
-          let a  = fresh_address () in
-          (* 3) Bind x ↦ Addr a in the closure’s env *)
-          let r' = (x, EnvAddr a) :: r_clo in
-
-          (* 4) Evaluate the body under that env, threading the store *)
-          let (v_body, st2) = eval_direct st1 r' body in
-
-          (* 5) Store the result at *that same* address a *)
-          let st3 = addOrUpdate_store st2 a v_body in
-
-          (* 6) And return *)
-          (v_body, st3)
-
-      | _ ->
-          failwith "Fix: expected a CloLam closure"
-      )
-    
+  
 
 
 (*-------------------------------------------------VERSION 2-----------------------------------------------------*)
@@ -257,7 +250,7 @@ let rec evalCPS (st : store) (r : env) (t : term) (k : value -> store -> 'gamma)
       match v with
       | CloLam(r', x, t') -> 
         evalCPS st1 r t2 (fun v' st2 -> (*B*)
-          let r'' = add_immutable_env r' x v' in
+          let r'' = add_immutable_val r' x v' in
           evalCPS st2 (r'') t' k
         )
       | CloSig(r', x, t') ->
@@ -270,53 +263,43 @@ let rec evalCPS (st : store) (r : env) (t : term) (k : value -> store -> 'gamma)
       
     | Int n -> k (IntVal n) st
     
-    | Add(t1, t2) ->
-          evalCPS st r t1 (fun v1 st1 -> (*C*)
-            evalCPS st1 r t2 (fun v2 st2 -> (*D*)
-              match (v1, v2) with
-              | (IntVal int1, IntVal int2) -> k (IntVal (int1 + int2)) st2
-              | _ -> failwith "both arguments of Add need to evaluate to integers!" )
-          )
-    | Mult(t1, t2) ->
+    | Add(t1, t2) -> (*can't force v1 and v2 to be intVals like we did in class because OCAML did not compile with a warning at runtime because the pattern matching is not exhausive (so just for safety will HAVE to check that these are ints not closures)*)
+    evalCPS st r t1 (fun v1 st1 -> (*C*)
+      evalCPS st1 r t2 (fun v2 st2 -> (*D*)
+        match (v1, v2) with
+        | (IntVal int1, IntVal int2) -> k (IntVal (int1 + int2)) st2
+        | _ -> failwith "both arguments of Add need to evaluate to integers!" ))
+    | Mult(t1, t2) -> (*like add had to change the logic up a bit and couldn't directly patternmatch on intvals*)
           evalCPS st r t1 (fun v1 st1 -> (*E*)
             evalCPS st1 r t2 (fun v2 st2 -> (*F*)
               match (v1, v2) with
               | (IntVal int1, IntVal int2) -> k (IntVal (int1 * int2)) st2
-              | _ -> failwith "both arguments of Mult need to evaluate to integers!")
-          )
-    
+              | _ -> failwith "both arguments of Mult need to evaluate to integers!")) 
+
     | IfZero(t, t1, t2) ->
           evalCPS st r t (fun v st1 -> (*G*)
             match v with
             | IntVal 0 -> evalCPS st1 r t1 k
             | IntVal _ -> evalCPS st1 r t2 k
-            | _ -> failwith "The condition of the if statement needs to evaluate to an integer!"
-          )
+            | _ -> failwith "The condition of the if statement needs to evaluate to an integer!")
 
-    (*made by chat*)
     | Fix t ->
-      evalCPS st r t (fun vf st1 -> (*H*)
-        match vf with
-        | CloLam(r_clo, x, body) ->
-            (* Allocate a single cell `a` for `f` *)
-            let a  = fresh_address () in
-            let r' = (x, EnvAddr a) :: r_clo in
-
-            (* Evaluate the body under the extended env `r'` *)
-            evalCPS st1 r' body (fun v_body st2 -> (*J*)
-              (* Store *into* that same address `a`! *)
-              let st3 = addOrUpdate_store st2 a v_body in
-              k v_body st3
+      evalCPS st r t (fun v st1 -> (*H*)
+        match v with
+        | CloLam (r', f, t') ->
+            let a = fresh_address () in
+            evalCPS st1 (add_immutable_addr r' f a) t' (fun v' st2 -> (*J*)
+              let st3 = addOrUpdate_store st2 a v' in
+              k v' st3
             )
-
-        | _ ->
-            failwith "Fix: expected CloLam"
-)
+        | _ -> failwith "Fix can only take in as input a lamda function"
+      )
+          
 
 
 (*-------------------------------------------------VERSION 3-----------------------------------------------------*)
 
-
+(*-------------------------------------------------3.1: final eval version in ocaml-----------------------------------------------------*)
 (*part4: defunctionalising*)
 
 (*note, we need to specify for every time we call evalCPS inside a continuation, a new name for that behaviour*)
@@ -334,6 +317,140 @@ type cont =
 (*no application case for ifs because once we evaluate condition branch we dont use it anymore*)
 | FixAr   of cont                     (* H*)
 | FixDone of address * cont           (* J*)
+
+let rec eval_defunc (st : store) (r : env) (t : term) (k : cont) : (value * store) =
+  match t with
+  | Var x ->
+      apply st (lookup_env r x st) k
+  | Lam(x, t') ->
+      apply st (CloLam(r, x, t')) k
+  | Sig(x, t') ->
+    apply st (CloSig(r, x, t')) k
+  | App(t1, t2) ->
+      (* Evaluate t1 first and notify through Ar that t2 needs to be evaluated next*)
+      eval_defunc st r t1 (Ar(r, t2, k))
+  | Int n ->  
+      apply st (IntVal n) k
+  | Add(t1,t2) ->
+    eval_defunc st r t1 (AddAr(r, t2, k))
+  | Mult(t1,t2) ->
+    eval_defunc st r t1 (MultAr(r, t2, k))
+  | IfZero(t, t1, t2) ->
+    eval_defunc st r t (IfAr(r, t1, t2, k))
+  | Fix t -> eval_defunc st r t (FixAr k)
+and apply (st : store) (v : value) (k : cont) : (value * store) =
+  match k with
+  | Halt -> (v,st) (*this is the final state mentioned in class --> from theorem will always be reached!*)
+  | Ar(r, t2, k) -> eval_defunc st r t2 (Ap(v, k))
+  | Ap (CloLam(r, x, t), k) -> 
+    eval_defunc st (add_immutable_val r x v) t k
+  | Ap (CloSig(r, x, t), k) ->
+    let (r', st') = addOrUpdate_mutable r x v st in (*so much cleaner with the helper*)
+    eval_defunc st' r' t k
+  | AddAr(r, t2, k) -> eval_defunc st r t2 (AddAp(v, k))
+  | AddAp(IntVal int1, k) -> (match v with
+    | IntVal int2 -> apply st (IntVal(int1+int2)) k
+    | _ -> failwith "second argument of Add needs to evaluate to an integer!")
+  | MultAr(r, t2, k) -> eval_defunc st r t2 (MultAp(v, k))
+  | MultAp(IntVal int1, k) -> (match v with
+    | IntVal int2 -> apply st (IntVal(int1*int2)) k
+    | _ -> failwith "second argument of Mult needs to evaluate to an integer!")
+  | IfAr(r, t1, t2, k) -> (match v with
+    |IntVal 0 -> eval_defunc st r t1 k
+    | IntVal _ -> eval_defunc st r t2 k
+    | _ -> failwith "The condition of the if statement needs to evaluate to an integer!")
+  | FixAr k2 -> (match v with
+      | CloLam(r', f, t') ->
+          let a  = fresh_address () in
+          eval_defunc st (add_immutable_addr r' f a) t' (FixDone(a, k2))
+      | _ -> failwith "Fix can only take in as input a lamda function")
+  | FixDone (a, k2) ->
+      let st' = addOrUpdate_store st a v in
+      apply st' v k2
+
+  | _ -> failwith "Invalid first argument types for Add or Mult"
+
+(*TESTING ALL THE HIGH LEVEL STULL*)
+
+(*example given in class to run this version of eval*)
+(*in class: eval' e = eval [] e (fun x -> x) but we defunctionalised it*)
+let eval_defunc' (t:term) : value  =
+  fst (eval_defunc TermMap.empty [] t (Halt)) (*both store and env start up as empty*)
+
+(*Creating these same helpers for the versions 1 and 2 of eval*)
+let evalCPS' (t:term) : value =
+  fst (evalCPS TermMap.empty [] t (fun v st -> (v, st))) (*as seen in class its the identity function*)
+
+let eval_direct' (t:term) : value =
+  fst (eval_direct TermMap.empty [] t) 
+
+
+let eval_algorithms : (string * (term -> value)) list = [
+  ("direct",  eval_direct');
+  ("cps",     evalCPS');
+  ("defunctionalised", eval_defunc')
+]
+
+(*EXAMPLE ALGORITHMS*)
+let fact_recursive =
+  Fix (Lam("f",
+    Lam("x",
+      IfZero(Var "x", Int 1,
+        Mult(Var "x", App(Var "f", Add(Var "x", Int (-1))))
+      )
+    )
+  ))
+  
+(*for this one had to also get chat GPT's help*)
+let fact_iterative =
+  Lam("n",
+    App(
+      Sig("acc",
+        App(
+          Fix (Lam("f",
+            Lam("x",
+              IfZero(Var "x",
+                      Var "acc",
+                      App(
+                        Sig("acc", Mult(Var "acc", Var "x")),  (* just update the existing acc *)
+                        App(Var "f", Add(Var "x", Int (-1)))
+                      )
+              )
+            )
+          )),
+          Var "n"
+        )
+      ),
+      Int 1
+    )
+  )
+  
+
+let fact_algorithms : (string * term) list = [
+  ("recursive",  fact_recursive);
+  ("iterative", fact_iterative);
+]
+
+
+let () = print_endline("TESTING THE NON-CONVERTED TO BYTECODE EVALS")
+
+(* Run all tests for n = 5*)
+(*obviously chat made this very clean tester*)
+let () =
+  List.iter (fun (ev_name, ev_fn) ->
+    List.iter (fun (algo_name, algo_term) ->
+      let t = App(algo_term, Int 5) in
+      match ev_fn t with
+      | IntVal v ->
+        print_endline (ev_name ^ "-" ^ algo_name ^ ": " ^ string_of_int v)
+      | _ ->
+        print_endline (ev_name ^ "-" ^ algo_name ^ ": WRONG OUTPUT ")
+    ) fact_algorithms
+  ) eval_algorithms
+
+
+(*-------------------------------------------------3.2: final eval version in bytecode-----------------------------------------------------*)
+
 
 (*Part 5: Bytecode conversion*)
 
@@ -506,7 +623,7 @@ and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program r
   | Halt -> (v,st) (*this is the final state mentioned in class --> from theorem will always be reached!*)
   | Ar(r, t2, k) -> eval' st r t2 (Ap(v, k))
   | Ap (CloLam(r, x, t), k) -> 
-    eval' st (add_immutable_env r x v) t k
+    eval' st (add_immutable_val r x v) t k
   | Ap (CloSig(r, x, t), k) ->
     let (r', st') = addOrUpdate_mutable r x v st in (*so much cleaner with the helper*)
     eval' st' r' t k
@@ -550,78 +667,6 @@ and apply (st : store) (v : value) (k : cont) (rs : registers) (prog : program r
   | _ -> failwith "Invalid argument types"
 
 
-(*example given in class to run this version of eval*)
-(*in class: eval' e = eval [] e (fun x -> x) but we defunctionalised it*)
-let eval' (t:term) : value  =
-  fst (eval TermMap.empty [] t (Halt) [] (ref [])) (*both store and env start up as empty*)
-
-(*Creating these same helpers for the versions 1 and 2 of eval*)
-let evalCPS' (t:term) : value =
-  fst (evalCPS TermMap.empty [] t (fun v st -> (v, st))) (*as seen in class its the identity function*)
-
-let eval_direct' (t:term) : value =
-  fst (eval_direct TermMap.empty [] t) 
-
-
-let eval_algorithms : (string * (term -> value)) list = [
-  ("direct",  eval_direct');
-  ("cps",     evalCPS');
-  ("defunctionalised", eval')
-]
-
-(*EXAMPLE ALGORITHMS made by chat*)
-let fact_recursive =
-  Fix (Lam("f",
-    Lam("x",
-      IfZero(Var "x", Int 1,
-        Mult(Var "x", App(Var "f", Add(Var "x", Int (-1))))
-      )
-    )
-  ))
-  
-
-  let fact_iterative =
-    Lam("n",
-      App(
-        Sig("acc",
-          App(
-            Fix (Lam("f",
-              Lam("x",
-                IfZero(Var "x",
-                        Var "acc",
-                        App(
-                          Sig("acc", Mult(Var "acc", Var "x")),  (* just update the existing acc *)
-                          App(Var "f", Add(Var "x", Int (-1)))
-                        )
-                )
-              )
-            )),
-            Var "n"
-          )
-        ),
-        Int 1
-      )
-    )
-
-
-let fact_algorithms : (string * term) list = [
-  ("recursive",  fact_recursive);
-  ("iterative", fact_iterative);
-]
-
-(* Run all tests for n = 5 chat as well*)
-let () =
-  List.iter (fun (ev_name, ev_fn) ->
-    List.iter (fun (algo_name, algo_term) ->
-      let t = App(algo_term, Int 5) in
-      match ev_fn t with
-      | IntVal v ->
-        print_endline (ev_name ^ "-" ^ algo_name ^ ": " ^ string_of_int v)
-      | _ ->
-        print_endline (ev_name ^ "-" ^ algo_name ^ ": WRONG OUTPUT ")
-    ) fact_algorithms
-  ) eval_algorithms
-
   
 let init (size : int) : env * store =
   let heap = TermMap.empty in
@@ -631,9 +676,9 @@ let init (size : int) : env * store =
 in ([], heap)
 
 let compile (t : term) (size : int) : (value * program * value list) =
-  let (env, store) = init size in
+  let (env, store) = ([], TermMap.empty) in
   let p : program ref = ref [] in
-  let regs = [("fp", ref EnvAddr 0);("sp", ref EnvAddr 0); ("r1", ref EnvAddr 0); ("v", ref EnvAddr 0)] in
+  let regs = [("fp", ref (IntVal 0));("sp", ref (IntVal 0)); ("r1", ref (IntVal 0)); ("v", ref (IntVal 0))] in
   let (v, _) = eval store [] t (Halt) regs p in
-  let (_, _, l, _) = get_values in
+  let (_, _, l, _) = get_values () in
   (v, !p, !l)
